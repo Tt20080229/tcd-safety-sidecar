@@ -1,59 +1,49 @@
 # FILE: tcd/cli/verify.py
 from __future__ import annotations
 
+"""
+tcd-verify — Receipt/chain verifier CLI with optional Prometheus & OpenTelemetry.
+
+Goals
+  - Verify a single receipt (head/body) with optional signature, objects, and witnesses.
+  - Verify a linear chain of receipts (heads/bodies) or JSONL stream.
+  - Optional SRE hooks: Prometheus histogram + OTel span per invocation.
+  - Production-hardening: stdin support, file/literal auto-detection, strict exit codes.
+
+Exit codes
+  0 = OK (verification success)
+  1 = Verification failed (cryptographic or structural mismatch)
+  2 = Input/usage error
+"""
+
 import io
 import json
+import os
 import sys
 import time
 from pathlib import Path
-from typing import List, Optional, Tuple
+from typing import Iterable, List, Optional, Tuple
 
 import click
 
-# Prom/OTel (optional)
-try:
-    from prometheus_client import Counter, Histogram, start_http_server
-    _HAS_PROM = True
-except Exception:
-    _HAS_PROM = False
-
+from ..exporter import TCDPrometheusExporter
 from ..otel_exporter import TCDOtelExporter
-from ..verify import verify_receipt, verify_chain
+from ..verify import verify_chain, verify_receipt
 
 
-# ---------- Metrics (optional) ----------
-
-_cli_verify_hist = None
-_cli_verify_ctr = None
-
-def _ensure_metrics(metrics_port: Optional[int]):
-    global _cli_verify_hist, _cli_verify_ctr
-    if not _HAS_PROM:
-        return
-    if _cli_verify_hist is None or _cli_verify_ctr is None:
-        _cli_verify_hist = Histogram(
-            "tcd_cli_verify_latency_seconds", "CLI verify latency",
-            buckets=(0.0002, 0.0005, 0.001, 0.002, 0.005, 0.01)
-        )
-        _cli_verify_ctr = Counter(
-            "tcd_cli_verify_total", "CLI verify results", ["kind", "status"]
-        )
-    if metrics_port and metrics_port > 0:
-        try:
-            start_http_server(metrics_port)
-        except Exception:
-            pass
-
-
-# ---------- Utilities ----------
+# ---------- Lightweight I/O utils ----------
 
 def _read_text(maybe_path: Optional[str]) -> Optional[str]:
-    """Load from path, '-' (stdin), or return literal string."""
+    """
+    Return text from:
+      - '-' (stdin)
+      - existing file path
+      - otherwise the literal string
+    """
     if maybe_path is None:
         return None
     if maybe_path == "-":
-        data = sys.stdin.read()
-        return data
+        return sys.stdin.read()
     p = Path(maybe_path)
     if p.exists() and p.is_file():
         return p.read_text(encoding="utf-8")
@@ -106,20 +96,20 @@ def _normalize_heads_bodies(
     jsonl: bool,
 ) -> Tuple[List[str], List[str]]:
     """
-    Load heads and bodies from files or JSONL.
-    Supported inputs:
-      - heads file: JSON array of hex strings (heads)
-      - bodies file: JSON array of canonical JSON strings (bodies)
-      - jsonl file (when jsonl=True): each line is an object containing:
+    Load heads/bodies for chain verification.
+
+    Modes:
+      - JSONL (--jsonl): --heads points to a JSONL where each line has
             {"receipt": "<head-hex>", "receipt_body": "<canonical-body-json>"}
-        or legacy keys { "head": "...", "body": "..." }
+        or legacy keys {"head": "...", "body": "..."}
+      - Non-JSONL: --heads and --bodies are JSON arrays (or single strings).
     """
     heads: List[str] = []
     bodies: List[str] = []
 
     if jsonl:
         if not heads_src:
-            raise click.BadParameter("When --jsonl is used, --heads must point to a JSONL file")
+            raise click.BadParameter("When --jsonl is used, --heads must point to a JSONL file or '-'")
         txt = _read_text(heads_src) or ""
         for line in io.StringIO(txt):
             s = line.strip()
@@ -139,6 +129,7 @@ def _normalize_heads_bodies(
             raise click.BadParameter("JSONL must contain aligned 'receipt' and 'receipt_body'")
         return heads, bodies
 
+    # Non-JSONL
     if heads_src:
         h = _read_json(heads_src)
         if isinstance(h, list):
@@ -171,50 +162,81 @@ def _print_result(ok: bool, dur_s: float, json_out: bool) -> int:
     return 0 if ok else 1
 
 
-# ---------- CLI ----------
+# ---------- Global SRE toggles (env defaults) ----------
+
+def _env_bool(key: str, default: bool) -> bool:
+    v = os.environ.get(key)
+    if v is None:
+        return default
+    return v.strip() not in ("0", "false", "False", "")
+
+
+DEFAULT_ENABLE_OTEL = _env_bool("TCD_CLI_OTEL", False)
+DEFAULT_ENABLE_PROM = _env_bool("TCD_CLI_PROM_HTTP", False)
+DEFAULT_PROM_PORT = int(os.environ.get("TCD_CLI_PROM_PORT", "8010"))
+
+
+# ---------- Click group with SRE context ----------
+
+class Ctx:
+    def __init__(self, enable_otel: bool, enable_prom: bool, prom_port: int):
+        self.otel = TCDOtelExporter(endpoint=os.environ.get("TCD_OTEL_ENDPOINT", "http://localhost:4318"))
+        # Toggle at call site; exporter has .enabled guard internally
+        if not enable_otel or not self.otel.enabled:
+            # Create a disabled shim (no-ops)
+            class _NoOtel:
+                enabled = False
+                def push_metrics(self, *_, **__):  # pragma: no cover
+                    return
+                def current_trace_ids(self):  # pragma: no cover
+                    return None, None
+            self.otel = _NoOtel()  # type: ignore
+
+        self.prom = TCDPrometheusExporter(
+            port=prom_port, version="0.10.2", config_hash="cli-verify"
+        )
+        self.prom_enabled = bool(enable_prom)
+        if self.prom_enabled:
+            self.prom.ensure_server()
+
 
 @click.group(context_settings={"help_option_names": ["-h", "--help"]})
-@click.option("--metrics-port", type=int, default=None, help="Expose Prometheus metrics on this port (optional)")
-@click.option("--otel", is_flag=True, help="Enable OpenTelemetry export (optional)")
-@click.option("--otel-endpoint", default="http://localhost:4318", show_default=True, help="OTLP HTTP endpoint")
+@click.option("--otel/--no-otel", default=DEFAULT_ENABLE_OTEL, show_default=True, help="Enable OpenTelemetry span for each verification.")
+@click.option("--prom-http/--no-prom-http", default=DEFAULT_ENABLE_PROM, show_default=True, help="Expose Prometheus /metrics (CLI as a short-lived server).")
+@click.option("--prom-port", type=int, default=DEFAULT_PROM_PORT, show_default=True, help="Prometheus port when --prom-http is enabled.")
 @click.pass_context
-def cli(ctx: click.Context, metrics_port: Optional[int], otel: bool, otel_endpoint: str):
-    """TCD Receipt Verifier — verify single receipts or chains with optional metrics."""
-    _ensure_metrics(metrics_port)
-    ctx.ensure_object(dict)
-    ctx.obj["METRICS_PORT"] = metrics_port
-    ctx.obj["OTEL_ENABLED"] = bool(otel)
-    ctx.obj["OTEL"] = TCDOtelExporter(endpoint=otel_endpoint) if otel else None
+def cli(ctx: click.Context, otel: bool, prom_http: bool, prom_port: int):
+    """TCD Receipt Verifier — verify single receipts or chains, with optional SRE instrumentation."""
+    ctx.obj = Ctx(enable_otel=otel, enable_prom=prom_http, prom_port=prom_port)
 
+
+# ---------- Commands ----------
 
 @cli.command("receipt")
-@click.option("--head", "head_hex", required=True, help="Receipt head hex (or @file / literal)")
-@click.option("--body", "body_src", required=True, help="Receipt body canonical JSON (path, '-', or literal JSON)")
-@click.option("--sig", "sig_hex", default=None, help="Optional Ed25519 signature hex")
-@click.option("--vk", "verify_key_hex", default=None, help="Optional Ed25519 verify key hex")
-@click.option("--req", "req_src", default=None, help="Optional req_obj JSON (path or literal JSON)")
-@click.option("--comp", "comp_src", default=None, help="Optional comp_obj JSON")
-@click.option("--e", "e_src", default=None, help="Optional e_obj JSON")
-@click.option("--witness", "witness_src", default=None, help="Optional witness JSON (object or triple array)")
-@click.option("--label-salt-hex", default=None, help="Optional label salt hex used at issue time")
-@click.option("--json", "json_out", is_flag=True, help="Print JSON result")
-@click.pass_context
-def receipt_cmd(
-    ctx: click.Context,
-    head_hex: str,
-    body_src: str,
-    sig_hex: Optional[str],
-    verify_key_hex: Optional[str],
-    req_src: Optional[str],
-    comp_src: Optional[str],
-    e_src: Optional[str],
-    witness_src: Optional[str],
-    label_salt_hex: Optional[str],
-    json_out: bool,
-):
+@click.option("--head", "head_hex", required=True, help="Receipt head hex (or file path / '-' / literal).")
+@click.option("--body", "body_src", required=True, help="Canonical body JSON (file path / '-' / literal JSON).")
+@click.option("--sig", "sig_hex", default=None, help="Optional Ed25519 signature hex.")
+@click.option("--vk", "verify_key_hex", default=None, help="Optional Ed25519 verify key hex.")
+@click.option("--req", "req_src", default=None, help="Optional req_obj JSON (file path / '-' / literal JSON).")
+@click.option("--comp", "comp_src", default=None, help="Optional comp_obj JSON.")
+@click.option("--e", "e_src", default=None, help="Optional e_obj JSON.")
+@click.option("--witness", "witness_src", default=None, help="Optional witness JSON (object {trace,spectrum,feat} or triple array).")
+@click.option("--label-salt-hex", default=None, help="Optional label salt hex used at issue time.")
+@click.option("--json", "json_out", is_flag=True, help="Emit JSON result.")
+@click.pass_obj
+def receipt_cmd(ctx: Ctx,
+                head_hex: str,
+                body_src: str,
+                sig_hex: Optional[str],
+                verify_key_hex: Optional[str],
+                req_src: Optional[str],
+                comp_src: Optional[str],
+                e_src: Optional[str],
+                witness_src: Optional[str],
+                label_salt_hex: Optional[str],
+                json_out: bool):
     """
     Verify a single receipt against its canonical body (+ optional signature and witnesses).
-    Exit codes: 0=ok, 1=verification failed, 2=bad input.
     """
     try:
         body_json = _read_text(body_src)
@@ -241,46 +263,31 @@ def receipt_cmd(
         strict=True,
         label_salt_hex=label_salt_hex,
     )
-    dur = time.perf_counter() - t0
+    dur = max(0.0, time.perf_counter() - t0)
 
-    if _HAS_PROM and _cli_verify_hist is not None and _cli_verify_ctr is not None:
-        _cli_verify_hist.observe(dur)
-        _cli_verify_ctr.labels("receipt", "ok" if ok else "fail").inc()
-
-    ot = ctx.obj.get("OTEL")
-    if ctx.obj.get("OTEL_ENABLED") and ot is not None:
-        try:
-            ot.push_metrics(float(ok), attrs={
-                "tcd.cli.kind": "receipt",
-                "tcd.cli.status": "ok" if ok else "fail",
-                "tcd.cli.latency_ms": dur * 1000.0,
-            })
-        except Exception:
-            pass
+    # SRE: metrics & trace
+    if ctx.prom_enabled:
+        ctx.prom.observe_latency(dur)
+    ctx.otel.push_metrics(float(bool(ok)), attrs={"tool": "tcd-verify", "mode": "receipt"})
 
     sys.exit(_print_result(bool(ok), dur, json_out))
 
 
 @cli.command("chain")
-@click.option("--heads", "heads_src", required=True, help="File with heads (JSON array) or JSONL when --jsonl")
-@click.option("--bodies", "bodies_src", default=None, help="File with bodies (JSON array); omit if --jsonl")
-@click.option("--jsonl", is_flag=True, help="Parse --heads as JSONL with {receipt, receipt_body}")
-@click.option("--label-salt-hex", default=None, help="Optional label salt hex used at issue time (reserved)")
-@click.option("--json", "json_out", is_flag=True, help="Print JSON result")
-@click.pass_context
-def chain_cmd(
-    ctx: click.Context,
-    heads_src: str,
-    bodies_src: Optional[str],
-    jsonl: bool,
-    label_salt_hex: Optional[str],
-    json_out: bool,
-):
+@click.option("--heads", "heads_src", required=True, help="File with heads (JSON array) or JSONL when --jsonl (use '-' to read from stdin).")
+@click.option("--bodies", "bodies_src", default=None, help="File with bodies (JSON array); omit if --jsonl.")
+@click.option("--jsonl", is_flag=True, help="Parse --heads as JSONL with {receipt, receipt_body}.")
+@click.option("--label-salt-hex", default=None, help="Optional label salt hex used at issue time (reserved).")
+@click.option("--json", "json_out", is_flag=True, help="Emit JSON result.")
+@click.pass_obj
+def chain_cmd(ctx: Ctx,
+              heads_src: str,
+              bodies_src: Optional[str],
+              jsonl: bool,
+              label_salt_hex: Optional[str],
+              json_out: bool):
     """
-    Verify a linear chain of receipts:
-      - non-JSONL: --heads <json-array> and --bodies <json-array> of equal length
-      - JSONL: --jsonl and --heads <file.jsonl> (each line has receipt & receipt_body)
-    Exit codes: 0=ok, 1=verification failed, 2=bad input.
+    Verify a linear chain of receipts.
     """
     try:
         heads, bodies = _normalize_heads_bodies(heads_src, bodies_src, jsonl=jsonl)
@@ -290,23 +297,11 @@ def chain_cmd(
 
     t0 = time.perf_counter()
     ok = verify_chain(heads, bodies, label_salt_hex=label_salt_hex)
-    dur = time.perf_counter() - t0
+    dur = max(0.0, time.perf_counter() - t0)
 
-    if _HAS_PROM and _cli_verify_hist is not None and _cli_verify_ctr is not None:
-        _cli_verify_hist.observe(dur)
-        _cli_verify_ctr.labels("chain", "ok" if ok else "fail").inc()
-
-    ot = ctx.obj.get("OTEL")
-    if ctx.obj.get("OTEL_ENABLED") and ot is not None:
-        try:
-            ot.push_metrics(float(ok), attrs={
-                "tcd.cli.kind": "chain",
-                "tcd.cli.status": "ok" if ok else "fail",
-                "tcd.cli.latency_ms": dur * 1000.0,
-                "tcd.cli.count": len(heads),
-            })
-        except Exception:
-            pass
+    if ctx.prom_enabled:
+        ctx.prom.observe_latency(dur)
+    ctx.otel.push_metrics(float(bool(ok)), attrs={"tool": "tcd-verify", "mode": "chain", "count": len(heads)})
 
     sys.exit(_print_result(bool(ok), dur, json_out))
 
@@ -318,6 +313,7 @@ def version_cmd():
 
 
 def main():
+    # Click will handle SystemExit codes; we avoid auto-exit in case embed as library.
     cli(standalone_mode=False)
 
 
@@ -329,3 +325,4 @@ if __name__ == "__main__":
     except Exception as e:
         click.echo(f"Unexpected error: {e}", err=True)
         sys.exit(2)
+
