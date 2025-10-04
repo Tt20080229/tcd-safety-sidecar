@@ -1,0 +1,619 @@
+// FILE: api/proto/tcd.proto
+syntax = "proto3";
+
+package tcd;
+
+import "google/protobuf/struct.proto";
+
+// --------------------
+// Messages
+// --------------------
+
+message DiagnoseRequest {
+  repeated double trace_vector = 1;
+  double entropy = 2;                       // 0.0 if unset
+  repeated double spectrum = 3;
+  repeated double features = 4;
+  int64 step_id = 5;                        // 0 if unset
+
+  string model_id = 10;
+  string gpu_id = 11;
+  string task = 12;
+  string lang = 13;
+  string tenant = 14;
+  string user = 15;
+  string session = 16;
+
+  google.protobuf.Struct context = 20;      // optional extra signals
+  int32 tokens_delta = 21;                  // approximate cost
+  double drift_score = 22;                  // drift weight, defaults to 0.0
+}
+
+message RiskComponent {
+  bool triggered = 1;
+  double severity = 2;
+  google.protobuf.Struct details = 3;
+}
+
+message RiskResponse {
+  bool verdict = 1;
+  double score = 2;
+  double threshold = 3;
+  double budget_remaining = 4;
+  map<string, RiskComponent> components = 5;
+  string cause = 6;                         // "detector" | "av" | ""
+  string action = 7;                        // "degrade" | "none"
+  int64 step = 8;
+  double e_value = 9;
+  double alpha_alloc = 10;
+  double alpha_spent = 11;
+
+  // Optional attested receipt (when enabled by policy)
+  string receipt_head = 12;
+  string receipt_body = 13;
+  string receipt_sig = 14;
+  string verify_key = 15;
+
+  string policy_ref = 16;                   // policy hash/ref if available
+  string config_hash = 17;                  // ServiceSettings hash snapshot
+}
+
+message WitnessSegments {
+  repeated uint64 trace = 1;
+  repeated uint64 spectrum = 2;
+  repeated uint64 feat = 3;
+}
+
+message SingleReceipt {
+  string head_hex = 1;
+  string body_json = 2;
+  string sig_hex = 3;                       // optional
+  string verify_key_hex = 4;                // optional
+  google.protobuf.Struct req_obj = 5;       // optional
+  google.protobuf.Struct comp_obj = 6;      // optional
+  google.protobuf.Struct e_obj = 7;         // optional
+  WitnessSegments witness = 8;              // optional
+  string label_salt_hex = 9;                // optional (reserved)
+}
+
+message ReceiptChain {
+  repeated string heads = 1;
+  repeated string bodies = 2;
+  string label_salt_hex = 3;                // optional (reserved)
+}
+
+message VerifyRequest {
+  oneof kind {
+    SingleReceipt single = 1;
+    ReceiptChain chain = 2;
+  }
+}
+
+message VerifyResponse {
+  bool ok = 1;
+  double latency_ms = 2;
+}
+
+message StateGetRequest {
+  string model_id = 1;
+  string gpu_id = 2;
+  string task = 3;
+  string lang = 4;
+}
+
+message StateGetResponse {
+  google.protobuf.Struct detector_state = 1;
+}
+
+message StateLoadRequest {
+  string model_id = 1;
+  string gpu_id = 2;
+  string task = 3;
+  string lang = 4;
+  google.protobuf.Struct state = 10;
+}
+
+message StateLoadResponse {
+  bool ok = 1;
+}
+
+message HealthRequest {}
+message HealthResponse {
+  bool ok = 1;
+  string config_hash = 2;
+  bool otel = 3;
+  bool prom = 4;
+}
+
+message VersionRequest {}
+message VersionResponse {
+  string version = 1;
+  string config_version = 2;
+  double alpha = 3;
+  double slo_latency_ms = 4;
+}
+
+// --------------------
+// Service
+// --------------------
+
+service TcdService {
+  rpc Diagnose (DiagnoseRequest) returns (RiskResponse);
+  rpc Verify   (VerifyRequest) returns (VerifyResponse);
+  rpc GetState (StateGetRequest) returns (StateGetResponse);
+  rpc LoadState (StateLoadRequest) returns (StateLoadResponse);
+  rpc Health (HealthRequest) returns (HealthResponse);
+  rpc Version (VersionRequest) returns (VersionResponse);
+}
+# FILE: tcd/service_grpc.py
+from __future__ import annotations
+
+import os
+import time
+import threading
+from typing import Any, Dict, List, Optional, Tuple
+
+# Import stubs lazily to avoid hard dependency at module import time
+def _pb():
+    from google.protobuf import struct_pb2  # type: ignore
+    from google.protobuf import json_format  # type: ignore
+    from tcd.proto import tcd_pb2, tcd_pb2_grpc  # type: ignore
+    return tcd_pb2, tcd_pb2_grpc, struct_pb2, json_format
+
+# Core building blocks reused from HTTP service
+from .config import make_reloadable_settings
+from .detector import TCDConfig, TraceCollapseDetector
+from .exporter import TCDPrometheusExporter
+from .multivariate import MultiVarConfig, MultiVarDetector
+from .otel_exporter import TCDOtelExporter
+from .ratelimit import RateLimiter
+from .risk_av import AlwaysValidConfig, AlwaysValidRiskController
+from .routing import StrategyRouter
+from .telemetry_gpu import GpuSampler
+from .utils import sanitize_floats
+from .attest import Attestor  # optional attestation
+from .receipt_v2 import build_v2_body
+from .verify import verify_receipt, verify_chain
+
+_settings = make_reloadable_settings()
+
+
+def _to_struct(d: Dict[str, Any]):
+    # Lazy import to keep top-level light
+    _, _, struct_pb2, json_format = _pb()
+    if d is None:
+        return struct_pb2.Struct()
+    return json_format.ParseDict(d, struct_pb2.Struct())  # type: ignore
+
+
+def _from_struct(s) -> Dict[str, Any]:
+    _, _, _, json_format = _pb()
+    if s is None:
+        return {}
+    return json_format.MessageToDict(s, preserving_proto_field_name=True)  # type: ignore
+
+
+def _quantize_nonneg(xs: List[float], scale: float = 1e6) -> List[int]:
+    # Quantize floats to uint32-safe non-negative integers for witness packing.
+    out: List[int] = []
+    for v in xs:
+        try:
+            iv = int(round(max(0.0, float(v)) * scale))
+        except Exception:
+            iv = 0
+        if iv > 0xFFFFFFFF:
+            iv = 0xFFFFFFFF
+        out.append(iv)
+    return out
+
+
+class _Core:
+    """Shared state for the gRPC service (mirrors HTTP create_app())."""
+
+    def __init__(self):
+        self.settings = _settings.get()
+        self.prom = TCDPrometheusExporter(
+            port=self.settings.prometheus_port,
+            version="0.10.2",
+            config_hash=self.settings.config_hash(),
+        )
+        if self.settings.prom_http_enable:
+            self.prom.ensure_server()
+
+        self.otel = TCDOtelExporter(endpoint=self.settings.otel_endpoint) if self.settings.otel_enable else TCDOtelExporter(endpoint=self.settings.otel_endpoint)  # type: ignore
+        self.signals_enabled = True  # placeholder (signals provider not required here)
+        self.gpu = GpuSampler(0) if self.settings.gpu_enable else None
+
+        # Rate limiting
+        self.rlim = RateLimiter(capacity=60.0, refill_per_s=30.0)
+
+        # Detectors keyed by (model,gpu,task,lang)
+        self._det_lock = threading.RLock()
+        self._detectors: Dict[Tuple[str, str, str, str], TraceCollapseDetector] = {}
+
+        # Always-valid controllers keyed by (tenant,user,session)
+        self._av_lock = threading.RLock()
+        self._av_by_subject: Dict[Tuple[str, str, str], AlwaysValidRiskController] = {}
+
+        # Optional multivariate detector per model
+        self._mv_lock = threading.RLock()
+        self._mv_by_model: Dict[str, MultiVarDetector] = {}
+
+        self.router = StrategyRouter()
+
+        # Optional attestation toggle (env / policy)
+        self.enable_receipts = os.environ.get("TCD_ENABLE_RECEIPTS", "1") == "1"
+        self.att = Attestor() if self.enable_receipts else None
+
+    # Accessors
+    def detector(self, k: Tuple[str, str, str, str]) -> TraceCollapseDetector:
+        with self._det_lock:
+            if k not in self._detectors:
+                self._detectors[k] = TraceCollapseDetector(config=TCDConfig())
+            return self._detectors[k]
+
+    def av(self, subject: Tuple[str, str, str]) -> AlwaysValidRiskController:
+        with self._av_lock:
+            if subject not in self._av_by_subject:
+                self._av_by_subject[subject] = AlwaysValidRiskController(
+                    AlwaysValidConfig(alpha_base=self.settings.alpha)
+                )
+            return self._av_by_subject[subject]
+
+    def mv(self, model_id: str) -> MultiVarDetector:
+        with self._mv_lock:
+            if model_id not in self._mv_by_model:
+                self._mv_by_model[model_id] = MultiVarDetector(
+                    MultiVarConfig(estimator="lw", alpha=0.01)
+                )
+            return self._mv_by_model[model_id]
+
+
+class _TcdServiceImpl:
+    """Business logic methods that are transport-agnostic."""
+
+    def __init__(self, core: _Core):
+        self.c = core
+
+    def _p_from_score(self, score: float) -> float:
+        s = max(0.0, min(1.0, float(score)))
+        return max(1e-9, 1.0 - s)
+
+    def diagnose(self, req: Dict[str, Any]) -> Dict[str, Any]:
+        t0 = time.perf_counter()
+
+        # Rate limiting key & cost
+        subject = (req["tenant"], req["user"], req["session"])
+        cost = max(1.0, float(req.get("tokens_delta", 50)) / 50.0)
+        if not self.c.rlim.consume(subject, cost=cost):
+            self.c.prom.throttle(*subject, reason="rate")
+            raise RuntimeError("rate limited")
+
+        # GPU sampling enriches context
+        context = dict(req.get("context") or {})
+        if self.c.gpu is not None:
+            try:
+                context.update(self.c.gpu.sample())
+            except Exception:
+                pass
+
+        # Sanitize numeric inputs
+        trace, _ = sanitize_floats(req.get("trace_vector") or [], max_len=4096)
+        spectrum, _ = sanitize_floats(req.get("spectrum") or [], max_len=4096)
+        features, _ = sanitize_floats(req.get("features") or [], max_len=2048)
+
+        # Detector
+        dkey = (req["model_id"], req["gpu_id"], req["task"], req["lang"])
+        det = self.c.detector(dkey)
+        verdict_pack = det.diagnose(trace, req.get("entropy"), spectrum, step_id=req.get("step_id"))
+
+        # Optional multivariate distance
+        mv_info = {}
+        if features:
+            try:
+                mv = self.c.mv(req["model_id"])
+                mv_info = mv.decision(np_array(features))  # type: ignore
+            except Exception:
+                mv_info = {}
+
+        score = float(verdict_pack.get("score", 0.0))
+        p_final = self._p_from_score(score)
+
+        # Always-valid step
+        av = self.c.av(subject)
+        drift_w = float(max(0.0, min(2.0, 1.0 + 0.5 * float(req.get("drift_score", 0.0)))))
+        av_out = av.step(
+            policy_key=(req["task"], req["lang"], req["model_id"]),
+            subject=subject,
+            scores={"final": score},
+            pvals={"final": p_final},
+            drift_weight=drift_w,
+        )
+
+        decision_fail = bool(verdict_pack.get("verdict", False) or av_out.get("trigger", False))
+
+        route = self.c.router.decide(
+            decision_fail,
+            score,
+            base_temp=float(context.get("temperature", 0.7)),
+            base_top_p=float(context.get("top_p", 0.9)),
+        )
+
+        # Metrics
+        lat_s = max(0.0, time.perf_counter() - t0)
+        self.c.prom.observe_latency(lat_s)
+        self.c.prom.push(verdict_pack, labels={"model_id": req["model_id"], "gpu_id": req["gpu_id"]})
+        self.c.prom.push_eprocess(
+            model_id=req["model_id"],
+            gpu_id=req["gpu_id"],
+            tenant=req["tenant"],
+            user=req["user"],
+            session=req["session"],
+            e_value=float(av_out.get("e_value", 1.0)),
+            alpha_alloc=float(av_out.get("alpha_alloc", 0.0)),
+            alpha_wealth=float(av_out.get("alpha_wealth", 0.0)),
+        )
+        self.c.prom.update_budget_metrics(
+            req["tenant"],
+            req["user"],
+            req["session"],
+            remaining=float(av_out.get("alpha_wealth", 0.0)),
+            spent=bool(av_out.get("alpha_spent", 0.0) > 0.0),
+        )
+        if decision_fail:
+            self.c.prom.record_action(req["model_id"], req["gpu_id"], action="degrade")
+        if (lat_s * 1000.0) > float(self.c.settings.slo_latency_ms):
+            self.c.prom.slo_violation_by_model("diagnose_latency", req["model_id"], req["gpu_id"])
+
+        # Optional attested receipt
+        rcpt_head = rcpt_body = rcpt_sig = vk_hex = ""
+        if self.c.enable_receipts and self.c.att is not None:
+            try:
+                # Minimal, content-decoupled receipt. Witness uses quantized non-negative ints.
+                wit = (
+                    _quantize_nonneg(trace[:128]),
+                    _quantize_nonneg(spectrum[:128]),
+                    _quantize_nonneg(features[:128]),
+                )
+                req_obj = {
+                    "tenant": req["tenant"],
+                    "user": req["user"],
+                    "session": req["session"],
+                    "model_id": req["model_id"],
+                    "gpu_id": req["gpu_id"],
+                    "task": req["task"],
+                    "lang": req["lang"],
+                }
+                comp_obj = {
+                    "decision": "FAIL" if decision_fail else "OK",
+                    "score": score,
+                    "route": route.tags,
+                }
+                e_obj = {
+                    "e_value": float(av_out.get("e_value", 1.0)),
+                    "alpha_alloc": float(av_out.get("alpha_alloc", 0.0)),
+                    "alpha_wealth": float(av_out.get("alpha_wealth", 0.0)),
+                }
+                meta = build_v2_body(
+                    model_hash="unknown:model",
+                    tokenizer_hash="unknown:tok",
+                    sampler_cfg={"temperature": route.temperature, "top_p": route.top_p, "decoder": route.decoder},
+                    context_len=int(len(trace) + len(spectrum)),
+                    kv_digest="",
+                    rng_seed=None,
+                    latency_ms=lat_s * 1000.0,
+                    throughput_tok_s=None,
+                    batch_index=0,
+                    batch_size=1,
+                    e_snapshot=e_obj,
+                )
+                out = self.c.att.issue(req_obj, comp_obj, e_obj, wit, meta=meta)  # type: ignore
+                rcpt_head, rcpt_body, rcpt_sig, vk_hex = (
+                    out["receipt"],
+                    out["receipt_body"],
+                    out.get("receipt_sig", "") or "",
+                    out.get("verify_key", "") or "",
+                )
+            except Exception:
+                # Do not fail decision path on attestor errors
+                self.c.prom.slo_violation("receipt_issue_fail")
+
+        return {
+            "verdict": decision_fail,
+            "score": score,
+            "threshold": float(av_out.get("threshold", 0.0)),
+            "budget_remaining": float(av_out.get("alpha_wealth", 0.0)),
+            "components": verdict_pack.get("components", {}),
+            "cause": "detector" if verdict_pack.get("verdict", False) else ("av" if av_out.get("trigger", False) else ""),
+            "action": "degrade" if decision_fail else "none",
+            "step": int(verdict_pack.get("step", 0)),
+            "e_value": float(av_out.get("e_value", 1.0)),
+            "alpha_alloc": float(av_out.get("alpha_alloc", 0.0)),
+            "alpha_spent": float(av_out.get("alpha_spent", 0.0)),
+            "receipt_head": rcpt_head,
+            "receipt_body": rcpt_body,
+            "receipt_sig": rcpt_sig,
+            "verify_key": vk_hex,
+            "policy_ref": "",  # reserved for policy integration
+            "config_hash": self.c.settings.config_hash(),
+        }
+
+
+# Numpy is optional; fall back to naive list -> 1xN row vector interface of MultiVarDetector
+def np_array(xs: List[float]):
+    try:
+        import numpy as _np  # type: ignore
+        return _np.asarray(xs, dtype=float)
+    except Exception:
+        class _Fallback:
+            def __init__(self, data): self._d = [float(x) for x in data]
+            @property
+            def shape(self): return (1, len(self._d))
+        return _Fallback(xs)
+
+
+# ---------------------------
+# gRPC Servicer (async)
+# ---------------------------
+
+class _TcdGrpcServicer:
+    def __init__(self, core: Optional[_Core] = None):
+        self.core = core or _Core()
+        self.impl = _TcdServiceImpl(self.core)
+        self.tcd_pb2, self.tcd_pb2_grpc, self.struct_pb2, self.json_format = _pb()
+
+    # ---- RPC methods ----
+    async def Diagnose(self, request, context):  # type: ignore
+        r = request
+        req = {
+            "trace_vector": list(r.trace_vector),
+            "entropy": (r.entropy if r.HasField("entropy") else None) if hasattr(r, "HasField") else (r.entropy or None),
+            "spectrum": list(r.spectrum),
+            "features": list(r.features),
+            "step_id": (r.step_id if r.step_id != 0 else None),
+            "model_id": r.model_id or "model0",
+            "gpu_id": r.gpu_id or "gpu0",
+            "task": r.task or "chat",
+            "lang": r.lang or "en",
+            "tenant": r.tenant or "tenant0",
+            "user": r.user or "user0",
+            "session": r.session or "sess0",
+            "context": _from_struct(r.context),
+            "tokens_delta": r.tokens_delta or 50,
+            "drift_score": r.drift_score or 0.0,
+        }
+        try:
+            out = self.impl.diagnose(req)
+        except RuntimeError as e:
+            await context.abort(8, str(e))  # RESOURCE_EXHAUSTED
+        except Exception as e:  # pragma: no cover
+            await context.abort(13, f"internal: {e}")  # INTERNAL
+
+        # Build response
+        pb = self.tcd_pb2
+        comp_map: Dict[str, Any] = out.get("components", {}) or {}
+        components = {}
+        for k, v in comp_map.items():
+            details = _to_struct(v.get("details") or {})
+            components[k] = pb.RiskComponent(
+                triggered=bool(v.get("triggered", False)),
+                severity=float(v.get("severity", 0.0)),
+                details=details,
+            )
+
+        return pb.RiskResponse(
+            verdict=bool(out["verdict"]),
+            score=float(out["score"]),
+            threshold=float(out["threshold"]),
+            budget_remaining=float(out["budget_remaining"]),
+            components=components,
+            cause=out.get("cause", ""),
+            action=out.get("action", ""),
+            step=int(out.get("step", 0)),
+            e_value=float(out.get("e_value", 1.0)),
+            alpha_alloc=float(out.get("alpha_alloc", 0.0)),
+            alpha_spent=float(out.get("alpha_spent", 0.0)),
+            receipt_head=out.get("receipt_head", ""),
+            receipt_body=out.get("receipt_body", ""),
+            receipt_sig=out.get("receipt_sig", ""),
+            verify_key=out.get("verify_key", ""),
+            policy_ref=out.get("policy_ref", ""),
+            config_hash=out.get("config_hash", ""),
+        )
+
+    async def Verify(self, request, context):  # type: ignore
+        pb = self.tcd_pb2
+        t0 = time.perf_counter()
+        ok = False
+        try:
+            if request.HasField("single"):
+                s = request.single
+                witness = None
+                if s.HasField("witness"):
+                    witness = (
+                        list(s.witness.trace),
+                        list(s.witness.spectrum),
+                        list(s.witness.feat),
+                    )
+                ok = bool(
+                    verify_receipt(
+                        receipt_head_hex=s.head_hex,
+                        receipt_body_json=s.body_json,
+                        verify_key_hex=s.verify_key_hex or None,
+                        receipt_sig_hex=s.sig_hex or None,
+                        req_obj=_from_struct(s.req_obj) if s.HasField("req_obj") else None,
+                        comp_obj=_from_struct(s.comp_obj) if s.HasField("comp_obj") else None,
+                        e_obj=_from_struct(s.e_obj) if s.HasField("e_obj") else None,
+                        witness_segments=witness,
+                        strict=True,
+                        label_salt_hex=(s.label_salt_hex or None),
+                    )
+                )
+            elif request.HasField("chain"):
+                ch = request.chain
+                ok = bool(verify_chain(list(ch.heads), list(ch.bodies), label_salt_hex=(ch.label_salt_hex or None)))
+            else:
+                await context.abort(3, "bad request")  # INVALID_ARGUMENT
+        except Exception:
+            ok = False
+        finally:
+            self.core.prom.observe_latency(max(0.0, time.perf_counter() - t0))
+            if not ok:
+                self.core.prom.slo_violation("verify_fail")
+        return pb.VerifyResponse(ok=bool(ok), latency_ms=(time.perf_counter() - t0) * 1000.0)
+
+    async def GetState(self, request, context):  # type: ignore
+        pb = self.tcd_pb2
+        det = self.core.detector((request.model_id or "model0", request.gpu_id or "gpu0", request.task or "chat", request.lang or "en"))
+        state = det.snapshot_state()
+        return pb.StateGetResponse(detector_state=_to_struct(state))
+
+    async def LoadState(self, request, context):  # type: ignore
+        pb = self.tcd_pb2
+        det = self.core.detector((request.model_id or "model0", request.gpu_id or "gpu0", request.task or "chat", request.lang or "en"))
+        det.load_state(_from_struct(request.state))
+        return pb.StateLoadResponse(ok=True)
+
+    async def Health(self, request, context):  # type: ignore
+        pb = self.tcd_pb2
+        return pb.HealthResponse(
+            ok=True,
+            config_hash=self.core.settings.config_hash(),
+            otel=bool(self.core.otel.enabled),  # type: ignore[attr-defined]
+            prom=True,
+        )
+
+    async def Version(self, request, context):  # type: ignore
+        pb = self.tcd_pb2
+        s = self.core.settings
+        return pb.VersionResponse(
+            version="0.10.2",
+            config_version=s.config_version,
+            alpha=float(s.alpha),
+            slo_latency_ms=float(s.slo_latency_ms),
+        )
+
+
+# ---------------------------
+# Server helpers
+# ---------------------------
+
+async def create_grpc_server(bind: str = "0.0.0.0:50051"):
+    """
+    Create and return an asyncio gRPC aio.Server bound to `bind`.
+    Caller is responsible for server.start() and server.wait_for_termination().
+    """
+    import grpc  # type: ignore
+    tcd_pb2, tcd_pb2_grpc, _, _ = _pb()
+
+    core = _Core()
+    servicer = _TcdGrpcServicer(core)
+
+    server = grpc.aio.server(options=[
+        ("grpc.max_send_message_length", 16 * 1024 * 1024),
+        ("grpc.max_receive_message_length", 16 * 1024 * 1024),
+    ])
+    tcd_pb2_grpc.add_TcdServiceServicer_to_server(servicer, server)
+    server.add_insecure_port(bind)
+    return server
+
