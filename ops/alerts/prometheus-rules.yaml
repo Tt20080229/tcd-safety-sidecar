@@ -1,0 +1,492 @@
+# FILE: ops/alerts/prometheus-rules.yaml
+# Prometheus Operator CRD (kube-prometheus-stack). If you run vanilla Prometheus,
+# you can copy spec.groups[].rules into a classic rules file.
+apiVersion: monitoring.coreos.com/v1
+kind: PrometheusRule
+metadata:
+  name: tcd-slo-and-safety
+  labels:
+    app: tcd
+    component: alerts
+spec:
+  groups:
+    - name: tcd-recordings
+      interval: 30s
+      rules:
+        # P50/P90/P99 diagnose latency (ms) per job/instance
+        - record: job:tcd_diagnose_p50_ms:5m
+          expr: histogram_quantile(0.50, sum(rate(tcd_decision_latency_ms_bucket[5m])) by (le, job, instance))
+        - record: job:tcd_diagnose_p90_ms:5m
+          expr: histogram_quantile(0.90, sum(rate(tcd_decision_latency_ms_bucket[5m])) by (le, job, instance))
+        - record: job:tcd_diagnose_p99_ms:5m
+          expr: histogram_quantile(0.99, sum(rate(tcd_decision_latency_ms_bucket[5m])) by (le, job, instance))
+
+        # Verify latency P99 (ms)
+        - record: job:tcd_verify_p99_ms:5m
+          expr: histogram_quantile(0.99, sum(rate(tcd_verify_latency_ms_bucket[5m])) by (le, job, instance))
+
+        # Throughput (RPS)
+        - record: job:tcd_diagnose_rps:1m
+          expr: sum(rate(tcd_diagnose_requests_total[1m])) by (job, instance)
+
+        # Degrade ratio (rolling 5m)
+        - record: job:tcd_degrade_ratio_5m
+          expr: sum(rate(tcd_action_total{action="degrade"}[5m])) by (job, instance)
+               /
+               sum(rate(tcd_diagnose_requests_total[5m])) by (job, instance)
+
+        # Verify fail rate (rolling)
+        - record: job:tcd_verify_fail_rate_5m
+          expr: sum(rate(tcd_slo_violation_total{type="verify_fail"}[5m])) by (job, instance)
+
+        # Backpressure/throttle rate
+        - record: job:tcd_throttle_ratio_5m
+          expr: sum(rate(tcd_throttle_total[5m])) by (job, instance)
+               /
+               sum(rate(tcd_diagnose_requests_total[5m])) by (job, instance)
+
+        # Optional mFDR estimate (preferred direct metric, else derived fallback)
+        - record: job:tcd_mfdr_estimate_10m
+          expr: |
+            max by(job,instance) (
+              tcd_av_mfdr_estimate
+            )
+            or
+            (
+              sum(rate(tcd_av_alpha_spent_total[10m])) by (job,instance)
+              /
+              clamp_min(sum(rate(tcd_av_rejections_total[10m])) by (job,instance), 1)
+            )
+
+    - name: tcd-slo-alerts
+      rules:
+        # SLO: P99 diagnose latency > 5 ms for 15m
+        - alert: TCDDiagnoseLatencyP99High
+          expr: job:tcd_diagnose_p99_ms:5m > 5
+          for: 15m
+          labels:
+            severity: page
+            team: sre
+          annotations:
+            summary: "TCD diagnose latency P99 high"
+            description: |
+              P99 diagnose latency is {{ $value }} ms (> 5 ms) for 15 minutes
+              on {{ $labels.job }}/{{ $labels.instance }}.
+              Check queue/backpressure, GC, and sketch memory.
+
+        # mFDR estimate above target (default target 0.10)
+        - alert: TCDmFDROutOfBound
+          expr: job:tcd_mfdr_estimate_10m > on(job,instance) (vector(0.10))
+          for: 10m
+          labels:
+            severity: critical
+            team: research
+          annotations:
+            summary: "TCD mFDR estimate exceeds target"
+            description: |
+              Estimated mFDR {{ $value | printf "%.3f" }} exceeds target 0.10
+              on {{ $labels.job }}/{{ $labels.instance }}.
+              Consider tightening alpha-investing or enabling conformal fallback.
+
+        # Alpha wealth low (per-tenant floor)
+        - alert: TCDAlphaWealthLow
+          expr: min by(tenant) (tcd_alpha_wealth) < 0.02
+          for: 10m
+          labels:
+            severity: warn
+            team: research
+          annotations:
+            summary: "TCD alpha-wealth low"
+            description: |
+              Tenant {{ $labels.tenant }} alpha-wealth below 0.02 for 10 minutes.
+              System will degrade (hysteresis). Review investing rate and drift.
+
+        # Any verify failure spikes red light
+        - alert: TCDReceiptVerifyFailures
+          expr: increase(tcd_slo_violation_total{type="verify_fail"}[5m]) > 0
+          for: 1m
+          labels:
+            severity: page
+            team: security
+          annotations:
+            summary: "TCD receipt verification failures detected"
+            description: |
+              Verification failures observed in the last 5 minutes on {{ $labels.job }}/{{ $labels.instance }}.
+              Inspect receipts and keys rotation, check attestor/verifier compatibility.
+
+        # Chain gap anomaly
+        - alert: TCDReceiptChainGap
+          expr: max_over_time(tcd_chain_gap[10m]) > 1
+          for: 5m
+          labels:
+            severity: page
+            team: security
+          annotations:
+            summary: "TCD receipt chain gap > 1"
+            description: |
+              Chain gap > 1 indicates broken linkage or missing receipts.
+              Switch to read-only mode and reconcile from latest consistent snapshot.
+
+        # Backpressure (throttle ratio > 5% for 10m)
+        - alert: TCDBackpressureThrottleHigh
+          expr: job:tcd_throttle_ratio_5m > 0.05
+          for: 10m
+          labels:
+            severity: warn
+            team: sre
+          annotations:
+            summary: "TCD backpressure throttle high"
+            description: |
+              Throttle ratio {{ $value | printf "%.2f" }} > 5% for 10m on {{ $labels.job }}/{{ $labels.instance }}.
+              Tune rate limits, HPA, or reduce sketch precision.
+
+        # Degrade ratio > 10% for 10m
+        - alert: TCDDegradeRatioHigh
+          expr: job:tcd_degrade_ratio_5m > 0.10
+          for: 10m
+          labels:
+            severity: warn
+            team: sre
+          annotations:
+            summary: "TCD degrade ratio high"
+            description: |
+              Degradation actions exceed 10% of traffic. Investigate detector thresholds,
+              drift scores, and AV wealth floor.
+
+{
+  "annotations": {
+    "list": []
+  },
+  "editable": true,
+  "gnetId": null,
+  "graphTooltip": 1,
+  "id": null,
+  "iteration": 1710000000000,
+  "links": [],
+  "panels": [
+    {
+      "type": "row",
+      "title": "Latency & Throughput",
+      "gridPos": { "h": 1, "w": 24, "x": 0, "y": 0 },
+      "collapsed": false,
+      "panels": []
+    },
+    {
+      "type": "timeseries",
+      "title": "Diagnose latency (P50/P90/P99, ms)",
+      "gridPos": { "h": 8, "w": 12, "x": 0, "y": 1 },
+      "datasource": { "type": "prometheus", "uid": "${datasource}" },
+      "targets": [
+        {
+          "expr": "job:tcd_diagnose_p50_ms:5m{job=~\"$job\",instance=~\"$instance\"}",
+          "legendFormat": "P50",
+          "refId": "A"
+        },
+        {
+          "expr": "job:tcd_diagnose_p90_ms:5m{job=~\"$job\",instance=~\"$instance\"}",
+          "legendFormat": "P90",
+          "refId": "B"
+        },
+        {
+          "expr": "job:tcd_diagnose_p99_ms:5m{job=~\"$job\",instance=~\"$instance\"}",
+          "legendFormat": "P99",
+          "refId": "C"
+        }
+      ],
+      "options": {
+        "legend": { "displayMode": "table", "placement": "right" },
+        "tooltip": { "mode": "multi" }
+      },
+      "fieldConfig": {
+        "defaults": { "unit": "ms" },
+        "overrides": []
+      }
+    },
+    {
+      "type": "timeseries",
+      "title": "Throughput (RPS)",
+      "gridPos": { "h": 8, "w": 12, "x": 12, "y": 1 },
+      "datasource": { "type": "prometheus", "uid": "${datasource}" },
+      "targets": [
+        {
+          "expr": "job:tcd_diagnose_rps:1m{job=~\"$job\",instance=~\"$instance\"}",
+          "legendFormat": "RPS",
+          "refId": "A"
+        }
+      ],
+      "options": {
+        "legend": { "displayMode": "list", "placement": "right" },
+        "tooltip": { "mode": "single" }
+      },
+      "fieldConfig": {
+        "defaults": { "unit": "req/s" },
+        "overrides": []
+      }
+    },
+    {
+      "type": "timeseries",
+      "title": "Verify latency P99 (ms)",
+      "gridPos": { "h": 7, "w": 12, "x": 0, "y": 9 },
+      "datasource": { "type": "prometheus", "uid": "${datasource}" },
+      "targets": [
+        {
+          "expr": "job:tcd_verify_p99_ms:5m{job=~\"$job\",instance=~\"$instance\"}",
+          "legendFormat": "P99",
+          "refId": "A"
+        }
+      ],
+      "options": {
+        "legend": { "displayMode": "list", "placement": "right" },
+        "tooltip": { "mode": "single" }
+      },
+      "fieldConfig": {
+        "defaults": { "unit": "ms" },
+        "overrides": []
+      }
+    },
+    {
+      "type": "timeseries",
+      "title": "Degrade ratio (5m)",
+      "gridPos": { "h": 7, "w": 12, "x": 12, "y": 9 },
+      "datasource": { "type": "prometheus", "uid": "${datasource}" },
+      "targets": [
+        {
+          "expr": "job:tcd_degrade_ratio_5m{job=~\"$job\",instance=~\"$instance\"}",
+          "legendFormat": "degrade %",
+          "refId": "A"
+        }
+      ],
+      "options": {
+        "legend": { "displayMode": "list", "placement": "right" },
+        "tooltip": { "mode": "single" }
+      },
+      "fieldConfig": {
+        "defaults": { "unit": "percentunit", "min": 0, "max": 1 },
+        "overrides": []
+      }
+    },
+    {
+      "type": "row",
+      "title": "Stat quality & AV",
+      "gridPos": { "h": 1, "w": 24, "x": 0, "y": 16 },
+      "collapsed": false,
+      "panels": []
+    },
+    {
+      "type": "gauge",
+      "title": "Alpha wealth (min across sessions, per tenant)",
+      "gridPos": { "h": 7, "w": 8, "x": 0, "y": 17 },
+      "datasource": { "type": "prometheus", "uid": "${datasource}" },
+      "targets": [
+        {
+          "expr": "min(tcd_alpha_wealth{tenant=~\"$tenant\"})",
+          "legendFormat": "min wealth",
+          "refId": "A"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "none",
+          "min": 0,
+          "max": 1,
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              { "color": "red", "value": 0 },
+              { "color": "orange", "value": 0.02 },
+              { "color": "green", "value": 0.1 }
+            ]
+          }
+        },
+        "overrides": []
+      },
+      "options": { "showThresholdLabels": true, "showThresholdMarkers": true }
+    },
+    {
+      "type": "timeseries",
+      "title": "e-value (sampled)",
+      "gridPos": { "h": 7, "w": 8, "x": 8, "y": 17 },
+      "datasource": { "type": "prometheus", "uid": "${datasource}" },
+      "targets": [
+        {
+          "expr": "avg_over_time(tcd_eprocess_value{tenant=~\"$tenant\"}[5m])",
+          "legendFormat": "e-value avg",
+          "refId": "A"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": { "unit": "none", "min": 0 },
+        "overrides": []
+      },
+      "options": { "legend": { "displayMode": "list", "placement": "right" } }
+    },
+    {
+      "type": "timeseries",
+      "title": "mFDR estimate (10m)",
+      "gridPos": { "h": 7, "w": 8, "x": 16, "y": 17 },
+      "datasource": { "type": "prometheus", "uid": "${datasource}" },
+      "targets": [
+        {
+          "expr": "job:tcd_mfdr_estimate_10m{job=~\"$job\",instance=~\"$instance\"}",
+          "legendFormat": "mFDR est",
+          "refId": "A"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "none",
+          "min": 0,
+          "max": 1,
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              { "color": "green", "value": 0 },
+              { "color": "orange", "value": 0.1 },
+              { "color": "red", "value": 0.2 }
+            ]
+          }
+        },
+        "overrides": []
+      }
+    },
+    {
+      "type": "row",
+      "title": "Verification & Chain Health",
+      "gridPos": { "h": 1, "w": 24, "x": 0, "y": 24 },
+      "collapsed": false,
+      "panels": []
+    },
+    {
+      "type": "timeseries",
+      "title": "Verify failures (5m rate)",
+      "gridPos": { "h": 7, "w": 12, "x": 0, "y": 25 },
+      "datasource": { "type": "prometheus", "uid": "${datasource}" },
+      "targets": [
+        {
+          "expr": "job:tcd_verify_fail_rate_5m{job=~\"$job\",instance=~\"$instance\"}",
+          "legendFormat": "verify_fail rate",
+          "refId": "A"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": { "unit": "1/s", "min": 0 },
+        "overrides": []
+      }
+    },
+    {
+      "type": "timeseries",
+      "title": "Chain gap",
+      "gridPos": { "h": 7, "w": 12, "x": 12, "y": 25 },
+      "datasource": { "type": "prometheus", "uid": "${datasource}" },
+      "targets": [
+        { "expr": "max(tcd_chain_gap)", "legendFormat": "gap", "refId": "A" }
+      ],
+      "fieldConfig": {
+        "defaults": { "unit": "none", "min": 0 },
+        "overrides": []
+      }
+    },
+    {
+      "type": "row",
+      "title": "Backpressure & Cost",
+      "gridPos": { "h": 1, "w": 24, "x": 0, "y": 32 },
+      "collapsed": false,
+      "panels": []
+    },
+    {
+      "type": "timeseries",
+      "title": "Throttle ratio (5m)",
+      "gridPos": { "h": 7, "w": 12, "x": 0, "y": 33 },
+      "datasource": { "type": "prometheus", "uid": "${datasource}" },
+      "targets": [
+        { "expr": "job:tcd_throttle_ratio_5m{job=~\"$job\",instance=~\"$instance\"}", "legendFormat": "throttle %", "refId": "A" }
+      ],
+      "fieldConfig": {
+        "defaults": { "unit": "percentunit", "min": 0, "max": 1 },
+        "overrides": []
+      }
+    },
+    {
+      "type": "bargauge",
+      "title": "Receipt size (P50/P99, bytes)",
+      "gridPos": { "h": 7, "w": 12, "x": 12, "y": 33 },
+      "datasource": { "type": "prometheus", "uid": "${datasource}" },
+      "targets": [
+        {
+          "expr": "histogram_quantile(0.50, sum(rate(tcd_receipt_size_bytes_bucket[5m])) by (le))",
+          "legendFormat": "P50",
+          "refId": "A"
+        },
+        {
+          "expr": "histogram_quantile(0.99, sum(rate(tcd_receipt_size_bytes_bucket[5m])) by (le))",
+          "legendFormat": "P99",
+          "refId": "B"
+        }
+      ],
+      "options": {
+        "displayMode": "lcd",
+        "orientation": "horizontal",
+        "reduceOptions": { "calcs": ["lastNotNull"], "values": false }
+      },
+      "fieldConfig": {
+        "defaults": { "unit": "bytes" },
+        "overrides": []
+      }
+    }
+  ],
+  "refresh": "10s",
+  "schemaVersion": 39,
+  "style": "dark",
+  "tags": ["tcd", "safety", "sre", "verification"],
+  "templating": {
+    "list": [
+      {
+        "name": "datasource",
+        "type": "datasource",
+        "query": "prometheus",
+        "current": { "selected": true },
+        "hide": 0
+      },
+      {
+        "type": "query",
+        "name": "job",
+        "label": "job",
+        "datasource": { "type": "prometheus", "uid": "${datasource}" },
+        "query": "label_values(tcd_diagnose_requests_total, job)",
+        "includeAll": true,
+        "multi": true,
+        "refresh": 2
+      },
+      {
+        "type": "query",
+        "name": "instance",
+        "label": "instance",
+        "datasource": { "type": "prometheus", "uid": "${datasource}" },
+        "query": "label_values(tcd_diagnose_requests_total{job=~\"$job\"}, instance)",
+        "includeAll": true,
+        "multi": true,
+        "refresh": 2
+      },
+      {
+        "type": "query",
+        "name": "tenant",
+        "label": "tenant",
+        "datasource": { "type": "prometheus", "uid": "${datasource}" },
+        "query": "label_values(tcd_alpha_wealth, tenant)",
+        "includeAll": true,
+        "multi": true,
+        "refresh": 2
+      }
+    ]
+  },
+  "time": { "from": "now-6h", "to": "now" },
+  "timepicker": {
+    "refresh_intervals": ["5s","10s","30s","1m","5m","15m","1h"]
+  },
+  "timezone": "",
+  "title": "TCD — Safety / SRE / Verification",
+  "uid": "tcd-main",
+  "version": 1,
+  "weekStart": ""
+}
+
