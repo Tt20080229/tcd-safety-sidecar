@@ -5,6 +5,25 @@ Provides online detection + always-valid (alpha-investing) control, optional ver
 
 ⸻
 
+Table of Contents
+	•	Features
+	•	Repository layout
+	•	Quick start
+	•	HTTP API
+	•	Verifiable receipts
+	•	Rate limiting & always-valid control
+	•	Observability
+	•	gRPC (optional)
+	•	CLI tools
+	•	Helm & Kubernetes
+	•	Storage helpers (optional)
+	•	Configuration
+	•	Development
+	•	License
+	•	Security & notes
+
+⸻
+
 Features
 	•	HTTP service (FastAPI): /diagnose, /verify, /healthz, /version, /state/*
 	•	Always-valid controller: e-process + alpha-investing to manage per-subject budget
