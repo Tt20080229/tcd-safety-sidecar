@@ -1,0 +1,553 @@
+# FILE: deploy/helm/Chart.yaml
+apiVersion: v2
+name: tcd
+description: "TCD — Attested & Verifiable Safety Sidecar (HTTP + Prom/OTel)"
+type: application
+version: 0.1.0
+appVersion: "0.10.2"
+keywords:
+  - safety
+  - sre
+  - verification
+  - receipts
+home: https://example.com/tcd
+sources:
+  - https://github.com/your-org/tcd
+maintainers:
+  - name: tcd-maintainers
+    email: sre@example.com
+# FILE: deploy/helm/values.yaml
+replicaCount: 2
+
+image:
+  repository: ghcr.io/your-org/tcd
+  tag: "0.10.2"
+  pullPolicy: IfNotPresent
+
+imagePullSecrets: []
+nameOverride: ""
+fullnameOverride: ""
+
+serviceAccount:
+  create: true
+  name: ""
+  annotations: {}
+
+podAnnotations: {}
+podLabels: {}
+
+podSecurityContext:
+  runAsNonRoot: true
+  runAsUser: 10001
+  runAsGroup: 10001
+  fsGroup: 10001
+  seccompProfile:
+    type: RuntimeDefault
+
+securityContext:
+  allowPrivilegeEscalation: false
+  readOnlyRootFilesystem: true
+  capabilities:
+    drop: ["ALL"]
+
+service:
+  type: ClusterIP
+  port: 8080
+  metricsPort: 8000
+  annotations: {}
+
+resources:
+  requests:
+    cpu: "200m"
+    memory: "256Mi"
+  limits:
+    cpu: "1"
+    memory: "512Mi"
+
+nodeSelector: {}
+tolerations: []
+affinity: {}
+
+topologySpreadConstraints:
+  enabled: true
+  # spread across nodes by default
+  rules:
+    - maxSkew: 1
+      topologyKey: kubernetes.io/hostname
+      whenUnsatisfiable: DoNotSchedule
+      labelSelector: {}
+
+# Feature toggles and runtime config (mapped to env of ServiceSettings)
+settings:
+  host: "0.0.0.0"
+  port: 8080
+  prometheusPort: 8000
+  alpha: 0.01
+  promHttpEnable: true
+  otelEnable: false
+  otelEndpoint: "http://otel-collector:4318"
+  gpuEnable: false
+  sloLatencyMs: 50.0
+  configVersion: "1"
+
+# Receipt issuance/verification pipeline
+receipts:
+  enable: true
+  # Provide attestation signing key & label salt via Secret below.
+
+# Secret material for receipts & label hashing.
+# For production, override via --set-file or externalSecret.
+secrets:
+  enabled: true
+  attestSkHex: "REPLACE_WITH_ED25519_SK_HEX"
+  labelSaltHex: "REPLACE_WITH_HEX_SALT"
+  labelSaltVersion: "1"
+
+# Optional external secret name (skip templated secret if set)
+existingSecretName: ""
+
+# Policy config stored in ConfigMap and mounted to /etc/tcd/policies.json
+policyConfig:
+  enabled: true
+  path: "/etc/tcd/policies.json"
+  json: |
+    {
+      "version": "1",
+      "rules": [
+        {
+          "name": "default",
+          "match": { "tenant": "*", "model_id": "*", "task": "*" },
+          "detector": { "on_threshold": 0.6, "off_threshold": 0.4 },
+          "av": { "alpha_base": 0.01 },
+          "routing": { "temperature_low": 0.2, "top_p_low": 0.7, "fallback_decoder": "greedy" },
+          "sre": { "slo_latency_ms": 50.0, "token_cost_divisor": 50.0 },
+          "verification": { "enable_receipts": true, "enable_verify_metrics": true }
+        }
+      ]
+    }
+
+serviceMonitor:
+  enabled: true
+  interval: 15s
+  scrapeTimeout: 10s
+  labels: {}
+
+hpa:
+  enabled: true
+  minReplicas: 2
+  maxReplicas: 10
+  metrics:
+    # scale on CPU utilization as default
+    - type: Resource
+      resource:
+        name: cpu
+        target:
+          type: Utilization
+          averageUtilization: 70
+
+pdb:
+  enabled: true
+  minAvailable: 1
+
+networkPolicy:
+  enabled: true
+  # allow ingress only from namespace and Prometheus
+  allowFromNamespaces:
+    - kube-system
+    - monitoring
+    - default
+  # allow egress to DNS and OTEL collector (if enabled)
+  otelNamespace: "monitoring"
+  otelAppSelector:
+    app.kubernetes.io/name: "otel-collector"
+
+extraEnv: []
+extraEnvFrom: []
+extraVolumeMounts: []
+extraVolumes: []
+
+# Uvicorn log level
+logLevel: "info"
+# FILE: deploy/helm/templates/_helpers.tpl
+{{- define "tcd.name" -}}
+{{- default .Chart.Name .Values.nameOverride | trunc 63 | trimSuffix "-" -}}
+{{- end -}}
+
+{{- define "tcd.fullname" -}}
+{{- if .Values.fullnameOverride -}}
+{{- .Values.fullnameOverride | trunc 63 | trimSuffix "-" -}}
+{{- else -}}
+{{- printf "%s-%s" .Release.Name (include "tcd.name" .) | trunc 63 | trimSuffix "-" -}}
+{{- end -}}
+{{- end -}}
+
+{{- define "tcd.labels" -}}
+app.kubernetes.io/name: {{ include "tcd.name" . }}
+app.kubernetes.io/instance: {{ .Release.Name }}
+app.kubernetes.io/version: {{ .Chart.AppVersion | quote }}
+app.kubernetes.io/managed-by: Helm
+app.kubernetes.io/part-of: tcd
+{{- end -}}
+
+{{- define "tcd.selectorLabels" -}}
+app.kubernetes.io/name: {{ include "tcd.name" . }}
+app.kubernetes.io/instance: {{ .Release.Name }}
+{{- end -}}
+
+{{- define "tcd.serviceAccountName" -}}
+{{- if .Values.serviceAccount.create -}}
+{{- default (include "tcd.fullname" .) .Values.serviceAccount.name -}}
+{{- else -}}
+{{- default "default" .Values.serviceAccount.name -}}
+{{- end -}}
+{{- end -}}
+# FILE: deploy/helm/templates/serviceaccount.yaml
+{{- if .Values.serviceAccount.create }}
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: {{ include "tcd.serviceAccountName" . }}
+  labels:
+    {{- include "tcd.labels" . | nindent 4 }}
+  annotations: {{- toYaml .Values.serviceAccount.annotations | nindent 4 }}
+{{- end }}
+# FILE: deploy/helm/templates/configmap.yaml
+{{- if .Values.policyConfig.enabled }}
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: {{ include "tcd.fullname" . }}-config
+  labels:
+    {{- include "tcd.labels" . | nindent 4 }}
+data:
+  policies.json: |
+{{- .Values.policyConfig.json | nindent 4 }}
+{{- end }}
+# FILE: deploy/helm/templates/secret.yaml
+{{- if and .Values.secrets.enabled (not .Values.existingSecretName) }}
+apiVersion: v1
+kind: Secret
+metadata:
+  name: {{ include "tcd.fullname" . }}-secrets
+  labels:
+    {{- include "tcd.labels" . | nindent 4 }}
+type: Opaque
+stringData:
+  TCD_ATTEST_SK_HEX: {{ .Values.secrets.attestSkHex | quote }}
+  TCD_LABEL_SALT_HEX: {{ .Values.secrets.labelSaltHex | quote }}
+  TCD_LABEL_SALT_VERSION: {{ .Values.secrets.labelSaltVersion | quote }}
+{{- end }}
+# FILE: deploy/helm/templates/service.yaml
+apiVersion: v1
+kind: Service
+metadata:
+  name: {{ include "tcd.fullname" . }}
+  labels:
+    {{- include "tcd.labels" . | nindent 4 }}
+  annotations:
+    {{- toYaml .Values.service.annotations | nindent 4 }}
+spec:
+  type: {{ .Values.service.type }}
+  selector:
+    {{- include "tcd.selectorLabels" . | nindent 4 }}
+  ports:
+    - name: http
+      port: {{ .Values.service.port }}
+      targetPort: http
+    - name: metrics
+      port: {{ .Values.service.metricsPort }}
+      targetPort: metrics
+# FILE: deploy/helm/templates/deployment.yaml
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: {{ include "tcd.fullname" . }}
+  labels:
+    {{- include "tcd.labels" . | nindent 4 }}
+spec:
+  replicas: {{ .Values.replicaCount }}
+  revisionHistoryLimit: 5
+  strategy:
+    type: RollingUpdate
+    rollingUpdate:
+      maxUnavailable: 0
+      maxSurge: 25%
+  selector:
+    matchLabels:
+      {{- include "tcd.selectorLabels" . | nindent 6 }}
+  template:
+    metadata:
+      labels:
+        {{- include "tcd.selectorLabels" . | nindent 8 }}
+        {{- toYaml .Values.podLabels | nindent 8 }}
+      annotations:
+        checksum/config: {{ toJson .Values.policyConfig.json | sha256sum }}
+        checksum/secrets: {{ toJson .Values.secrets | sha256sum }}
+        {{- toYaml .Values.podAnnotations | nindent 8 }}
+    spec:
+      serviceAccountName: {{ include "tcd.serviceAccountName" . }}
+      securityContext:
+        {{- toYaml .Values.podSecurityContext | nindent 8 }}
+      containers:
+        - name: tcd
+          image: "{{ .Values.image.repository }}:{{ .Values.image.tag }}"
+          imagePullPolicy: {{ .Values.image.pullPolicy }}
+          args:
+            - "tcd-serve-http"
+            - "--log-level"
+            - "{{ .Values.logLevel }}"
+          env:
+            - name: OTEL_EXPORTER_OTLP_ENDPOINT
+              value: "{{ .Values.settings.otelEndpoint }}"
+            - name: TCD_OTEL_ENABLE
+              value: "{{ ternary "1" "0" .Values.settings.otelEnable }}"
+            - name: TCD_PROM_HTTP
+              value: "{{ ternary "1" "0" .Values.settings.promHttpEnable }}"
+            - name: TCD_GPU_ENABLE
+              value: "{{ ternary "1" "0" .Values.settings.gpuEnable }}"
+            - name: TCD_ALPHA
+              value: "{{ .Values.settings.alpha }}"
+            - name: TCD_SLO_LATENCY_MS
+              value: "{{ .Values.settings.sloLatencyMs }}"
+            - name: TCD_CONFIG_VERSION
+              value: "{{ .Values.settings.configVersion }}"
+            - name: TCD_PORT
+              value: "{{ .Values.settings.port }}"
+            - name: TCD_PROMETHEUS_PORT
+              value: "{{ .Values.settings.prometheusPort }}"
+            - name: TCD_POLICIES_PATH
+              value: "{{ .Values.policyConfig.path }}"
+            - name: TCD_RECEIPTS_ENABLE
+              value: "{{ ternary "1" "0" .Values.receipts.enable }}"
+            {{- if .Values.existingSecretName }}
+            - name: TCD_ATTEST_SK_HEX
+              valueFrom:
+                secretKeyRef:
+                  name: {{ .Values.existingSecretName }}
+                  key: TCD_ATTEST_SK_HEX
+            - name: TCD_LABEL_SALT_HEX
+              valueFrom:
+                secretKeyRef:
+                  name: {{ .Values.existingSecretName }}
+                  key: TCD_LABEL_SALT_HEX
+            - name: TCD_LABEL_SALT_VERSION
+              valueFrom:
+                secretKeyRef:
+                  name: {{ .Values.existingSecretName }}
+                  key: TCD_LABEL_SALT_VERSION
+            {{- else if .Values.secrets.enabled }}
+            - name: TCD_ATTEST_SK_HEX
+              valueFrom:
+                secretKeyRef:
+                  name: {{ include "tcd.fullname" . }}-secrets
+                  key: TCD_ATTEST_SK_HEX
+            - name: TCD_LABEL_SALT_HEX
+              valueFrom:
+                secretKeyRef:
+                  name: {{ include "tcd.fullname" . }}-secrets
+                  key: TCD_LABEL_SALT_HEX
+            - name: TCD_LABEL_SALT_VERSION
+              valueFrom:
+                secretKeyRef:
+                  name: {{ include "tcd.fullname" . }}-secrets
+                  key: TCD_LABEL_SALT_VERSION
+            {{- end }}
+            {{- with .Values.extraEnv }}
+            {{- toYaml . | nindent 12 }}
+            {{- end }}
+          envFrom:
+            {{- with .Values.extraEnvFrom }}
+            {{- toYaml . | nindent 12 }}
+            {{- end }}
+          ports:
+            - name: http
+              containerPort: {{ .Values.settings.port }}
+            - name: metrics
+              containerPort: {{ .Values.settings.prometheusPort }}
+          readinessProbe:
+            httpGet:
+              path: /healthz
+              port: http
+            initialDelaySeconds: 2
+            periodSeconds: 5
+            timeoutSeconds: 2
+            failureThreshold: 6
+          livenessProbe:
+            httpGet:
+              path: /healthz
+              port: http
+            initialDelaySeconds: 10
+            periodSeconds: 10
+            timeoutSeconds: 2
+            failureThreshold: 3
+          resources:
+            {{- toYaml .Values.resources | nindent 12 }}
+          volumeMounts:
+            {{- if .Values.policyConfig.enabled }}
+            - name: config
+              mountPath: {{ .Values.policyConfig.path }}
+              subPath: policies.json
+              readOnly: true
+            {{- end }}
+            {{- with .Values.extraVolumeMounts }}
+            {{- toYaml . | nindent 12 }}
+            {{- end }}
+      volumes:
+        {{- if .Values.policyConfig.enabled }}
+        - name: config
+          configMap:
+            name: {{ include "tcd.fullname" . }}-config
+        {{- end }}
+        {{- with .Values.extraVolumes }}
+        {{- toYaml . | nindent 8 }}
+        {{- end }}
+      {{- if .Values.topologySpreadConstraints.enabled }}
+      topologySpreadConstraints:
+      {{- range .Values.topologySpreadConstraints.rules }}
+        - maxSkew: {{ .maxSkew }}
+          topologyKey: {{ .topologyKey }}
+          whenUnsatisfiable: {{ .whenUnsatisfiable }}
+          labelSelector:
+            matchLabels:
+              {{- include "tcd.selectorLabels" $ | nindent 14 }}
+      {{- end }}
+      {{- end }}
+      imagePullSecrets:
+        {{- toYaml .Values.imagePullSecrets | nindent 8 }}
+# FILE: deploy/helm/templates/hpa.yaml
+{{- if .Values.hpa.enabled }}
+apiVersion: autoscaling/v2
+kind: HorizontalPodAutoscaler
+metadata:
+  name: {{ include "tcd.fullname" . }}
+  labels:
+    {{- include "tcd.labels" . | nindent 4 }}
+spec:
+  scaleTargetRef:
+    apiVersion: apps/v1
+    kind: Deployment
+    name: {{ include "tcd.fullname" . }}
+  minReplicas: {{ .Values.hpa.minReplicas }}
+  maxReplicas: {{ .Values.hpa.maxReplicas }}
+  metrics:
+  {{- toYaml .Values.hpa.metrics | nindent 2 }}
+{{- end }}
+# FILE: deploy/helm/templates/pdb.yaml
+{{- if .Values.pdb.enabled }}
+apiVersion: policy/v1
+kind: PodDisruptionBudget
+metadata:
+  name: {{ include "tcd.fullname" . }}
+  labels:
+    {{- include "tcd.labels" . | nindent 4 }}
+spec:
+  minAvailable: {{ .Values.pdb.minAvailable }}
+  selector:
+    matchLabels:
+      {{- include "tcd.selectorLabels" . | nindent 6 }}
+{{- end }}
+# FILE: deploy/helm/templates/servicemonitor.yaml
+{{- if .Values.serviceMonitor.enabled }}
+apiVersion: monitoring.coreos.com/v1
+kind: ServiceMonitor
+metadata:
+  name: {{ include "tcd.fullname" . }}
+  labels:
+    {{- include "tcd.labels" . | nindent 4 }}
+    {{- toYaml .Values.serviceMonitor.labels | nindent 4 }}
+spec:
+  selector:
+    matchLabels:
+      {{- include "tcd.selectorLabels" . | nindent 6 }}
+  endpoints:
+    - port: metrics
+      path: /metrics
+      interval: {{ .Values.serviceMonitor.interval }}
+      scrapeTimeout: {{ .Values.serviceMonitor.scrapeTimeout }}
+  namespaceSelector:
+    matchNames:
+      - {{ .Release.Namespace }}
+{{- end }}
+# FILE: deploy/helm/templates/networkpolicy.yaml
+{{- if .Values.networkPolicy.enabled }}
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: {{ include "tcd.fullname" . }}
+  labels:
+    {{- include "tcd.labels" . | nindent 4 }}
+spec:
+  podSelector:
+    matchLabels:
+      {{- include "tcd.selectorLabels" . | nindent 6 }}
+  policyTypes:
+    - Ingress
+    - Egress
+  ingress:
+    - from:
+      {{- range .Values.networkPolicy.allowFromNamespaces }}
+        - namespaceSelector:
+            matchLabels:
+              kubernetes.io/metadata.name: {{ . | quote }}
+      {{- end }}
+      ports:
+        - port: {{ .Values.service.port }}
+        - port: {{ .Values.service.metricsPort }}
+  egress:
+    # DNS
+    - to:
+        - namespaceSelector:
+            matchLabels:
+              kubernetes.io/metadata.name: "kube-system"
+      ports:
+        - port: 53
+          protocol: UDP
+        - port: 53
+          protocol: TCP
+    # OTEL collector if enabled
+    - to:
+        - namespaceSelector:
+            matchLabels:
+              kubernetes.io/metadata.name: {{ .Values.networkPolicy.otelNamespace | quote }}
+          podSelector:
+            matchLabels:
+              {{- toYaml .Values.networkPolicy.otelAppSelector | nindent 14 }}
+      ports:
+        - port: 4318
+          protocol: TCP
+{{- end }}
+# FILE: deploy/helm/templates/NOTES.txt
+TCD was deployed.
+
+Service:
+  http:     {{ include "tcd.fullname" . }}.{{ .Release.Namespace }}.svc:{{ .Values.service.port }}
+  metrics:  {{ include "tcd.fullname" . }}.{{ .Release.Namespace }}.svc:{{ .Values.service.metricsPort }}
+
+Prometheus:
+  ServiceMonitor {{ ternary "ENABLED" "DISABLED" .Values.serviceMonitor.enabled }}
+
+Receipts:
+  {{ ternary "ENABLED" "DISABLED" .Values.receipts.enable }}
+  If ENABLED, ensure Secret has valid:
+    - TCD_ATTEST_SK_HEX (Ed25519 signing key)
+    - TCD_LABEL_SALT_HEX (blake3 label salt)
+    - TCD_LABEL_SALT_VERSION
+  Current secret source:
+    {{ if .Values.existingSecretName -}}
+    external secret {{ .Values.existingSecretName }}
+    {{- else -}}
+    templated secret {{ include "tcd.fullname" . }}-secrets
+    {{- end }}
+
+Policy:
+  Mounted at {{ .Values.policyConfig.path }}
+  To update policies and roll pods automatically:
+    helm upgrade --reuse-values --set-file policyConfig.json=policies.json {{ .Release.Name }} .
+
+Rollout:
+  Strategy maxUnavailable=0, PDB minAvailable={{ .Values.pdb.minAvailable }} — supports node drain.
+
+Quick port-forward:
+  kubectl port-forward svc/{{ include "tcd.fullname" . }} 8080:{{ .Values.service.port }} 8000:{{ .Values.service.metricsPort }}
+  curl -s http://127.0.0.1:8080/healthz
+  curl -s http://127.0.0.1:8000/metrics | head
