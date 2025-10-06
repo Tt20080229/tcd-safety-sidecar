@@ -1,6 +1,12 @@
 # FILE: tcd/auditor.py
 from __future__ import annotations
 
+"""Chain auditor for verifiable receipts.
+
+Runs integrity checks over recent receipts, exports Prometheus metrics,
+and provides both a one-shot `audit()` function and a periodic `ChainAuditor`.
+"""
+
 import dataclasses
 import json
 import logging
@@ -10,6 +16,16 @@ import time
 from typing import Any, Dict, Iterable, List, NamedTuple, Optional, Tuple
 
 from prometheus_client import REGISTRY, CollectorRegistry, Counter, Gauge, Histogram
+
+__all__ = [
+    "ReceiptRow",
+    "ReceiptStore",
+    "ChainAuditConfig",
+    "ChainAuditReport",
+    "build_metrics",
+    "audit",
+    "ChainAuditor",
+]
 
 logger = logging.getLogger(__name__)
 
@@ -189,8 +205,13 @@ def audit(store: ReceiptStore, cfg: ChainAuditConfig, *, metrics: _Metrics = _ME
 
 
 class ChainAuditor:
-    def __init__(self, store: ReceiptStore, cfg: ChainAuditConfig = ChainAuditConfig(),
-                 *, metrics: _Metrics = _METRICS):
+    def __init__(
+        self,
+        store: ReceiptStore,
+        cfg: ChainAuditConfig = ChainAuditConfig(),
+        *,
+        metrics: _Metrics = _METRICS,
+    ):
         self._store = store
         self._cfg = cfg
         self._metrics = metrics
