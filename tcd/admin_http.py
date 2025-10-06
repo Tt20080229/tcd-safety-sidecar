@@ -1,38 +1,46 @@
 # FILE: tcd/admin_http.py
 from __future__ import annotations
 
+import json
+import hmac
+import logging
 import os
 import threading
 import time
-from dataclasses import dataclass
-from typing import Any, Callable, Dict, List, Optional, Tuple
+from dataclasses import dataclass, asdict, is_dataclass
+from typing import Any, Callable, Dict, List, Optional, Tuple, Protocol, Literal
 
 from fastapi import Depends, FastAPI, Header, HTTPException
-from pydantic import BaseModel, Field, ValidationError
+from pydantic import BaseModel, Field, field_validator
 
 from .config import make_reloadable_settings
 from .crypto import Blake3Hash
 from .policies import BoundPolicy, PolicyRule, PolicyStore
 from .verify import verify_chain, verify_receipt
 
-# Optional collaborators; all are *pluggable* to avoid tight coupling
+# -----------------------------------------------------------------------------
+# Optional collaborators (kept pluggable to avoid tight coupling)
+# -----------------------------------------------------------------------------
 try:
     from .attest import Attestor  # noqa: F401
 except Exception:  # pragma: no cover
     Attestor = object  # type: ignore[misc,assignment]
 
+logger = logging.getLogger(__name__)
+
+# -----------------------------------------------------------------------------
 # Receipt storage protocol (optional)
-class ReceiptStorageProtocol:
+# -----------------------------------------------------------------------------
+class ReceiptStorageProtocol(Protocol):
     def put(self, head_hex: str, body_json: str) -> None: ...
     def get(self, head_hex: str) -> Optional[str]: ...
     def tail(self, n: int) -> List[Tuple[str, str]]: ...
     def stats(self) -> Dict[str, Any]: ...
 
 
-# ---------------------------
+# -----------------------------------------------------------------------------
 # Admin context & dependency
-# ---------------------------
-
+# -----------------------------------------------------------------------------
 @dataclass
 class AdminContext:
     policies: PolicyStore
@@ -43,8 +51,9 @@ class AdminContext:
     alpha_probe_fn: Optional[Callable[[str, str, str], Optional[Dict[str, Any]]]] = None
 
 
-_settings_hot = make_reloadable_settings()
-_admin_lock = threading.RLock()
+_SETTINGS_HOT = make_reloadable_settings()
+_ADMIN_LOCK = threading.RLock()
+_ADMIN_API_VERSION = os.getenv("TCD_ADMIN_API_VERSION", "0.10.3")
 
 
 def _require_admin(token: Optional[str] = Header(default=None, alias="X-TCD-Admin-Token")) -> None:
@@ -61,20 +70,47 @@ def _require_admin(token: Optional[str] = Header(default=None, alias="X-TCD-Admi
         raise HTTPException(status_code=401, detail="admin token required")
     if not token or len(token) != len(want):
         raise HTTPException(status_code=403, detail="forbidden")
-    # constant-time compare
-    ok = 0
-    for a, b in zip(token.encode("utf-8"), want.encode("utf-8")):
-        ok |= a ^ b
-    if ok != 0:
+    # constant-time compare (safer & shorter than手写 XOR)
+    if not hmac.compare_digest(token, want):
         raise HTTPException(status_code=403, detail="forbidden")
 
 
-# ---------------------------
-# Pydantic I/O schemas
-# ---------------------------
+# -----------------------------------------------------------------------------
+# Utilities
+# -----------------------------------------------------------------------------
+def _dump_cfg(obj: Any) -> Dict[str, Any]:
+    """Best-effort, side-effect-free dict dump for config-like objects."""
+    if hasattr(obj, "model_dump"):
+        return dict(obj.model_dump())  # pydantic v2
+    if is_dataclass(obj):
+        return asdict(obj)
+    if isinstance(obj, dict):
+        return obj
+    # fallback: public attrs only
+    try:
+        return {k: v for k, v in vars(obj).items() if not k.startswith("_")}
+    except Exception:
+        return {}
 
+
+def _is_hex(s: Optional[str]) -> bool:
+    if not s:
+        return True
+    if len(s) % 2 != 0:
+        return False
+    try:
+        bytes.fromhex(s)
+        return True
+    except Exception:
+        return False
+
+
+# -----------------------------------------------------------------------------
+# Pydantic I/O schemas
+# -----------------------------------------------------------------------------
 class ReloadRequest(BaseModel):
-    source: str = Field(default="env", pattern="^(env|file)$")
+    # v2: Literal 做真正校验（v1 的 regex/pattern 在 v2 不推荐）
+    source: Literal["env", "file"] = "env"
     path: Optional[str] = None  # when source=file
 
 
@@ -119,11 +155,33 @@ class VerifyReceiptIn(BaseModel):
     label_salt_hex: Optional[str] = None
     strict: bool = True
 
+    # 基础十六进制校验，避免明显垃圾输入打爆 verify 逻辑
+    @field_validator("head_hex", "sig_hex", "verify_key_hex", "label_salt_hex")
+    @classmethod
+    def _hex_ok(cls, v: Optional[str]) -> Optional[str]:
+        if v is not None and not _is_hex(v):
+            raise ValueError("invalid hex")
+        return v
+
 
 class VerifyChainIn(BaseModel):
     heads: List[str]
     bodies: List[str]
     label_salt_hex: Optional[str] = None
+
+    @field_validator("heads")
+    @classmethod
+    def _heads_hex(cls, v: List[str]) -> List[str]:
+        if not all(_is_hex(x) for x in v):
+            raise ValueError("invalid head hex in list")
+        return v
+
+    @field_validator("label_salt_hex")
+    @classmethod
+    def _salt_hex(cls, v: Optional[str]) -> Optional[str]:
+        if v is not None and not _is_hex(v):
+            raise ValueError("invalid hex")
+        return v
 
 
 class VerifyOut(BaseModel):
@@ -138,7 +196,7 @@ class ReceiptGetOut(BaseModel):
 
 
 class ReceiptTailOut(BaseModel):
-    items: List[Tuple[str, str]]  # (head, body)
+    items: List[Tuple[str, str]]  # (head, body) — 注意：JSON 序列化为 list[list[str,str]]
     total: int
 
 
@@ -156,50 +214,69 @@ class RuntimeOut(BaseModel):
     stats: Dict[str, Any]
 
 
-# ---------------------------
+# -----------------------------------------------------------------------------
 # Admin app factory
-# ---------------------------
-
+# -----------------------------------------------------------------------------
 def create_admin_app(ctx: AdminContext) -> FastAPI:
-    app = FastAPI(title="tcd-admin", version="0.10.2")
+    """
+    构建 admin-only FastAPI 应用：
+    - 所有路由都挂载在 /admin/* 下，统一用 _require_admin 保护
+    - 只做控制面：策略、验证、观测、配置热加载
+    """
+    app = FastAPI(title="tcd-admin", version=_ADMIN_API_VERSION)
     hasher = Blake3Hash()
+
+    # 缓存最近一次 policy 集合的摘要，避免高频 GET/ref 计算开销
+    _policy_digest_cache: Dict[int, str] = {}
 
     def _policy_digest(rules: List[PolicyRule]) -> str:
         try:
+            key = id(rules)
+            if key in _policy_digest_cache:
+                return _policy_digest_cache[key]
             canon = {
                 "rules": [r.model_dump() for r in rules],
                 "version": "1",
             }
-            return hasher.hex(
-                json.dumps(canon, sort_keys=True, ensure_ascii=False, separators=(",", ":")).encode("utf-8"),
+            digest = hasher.hex(
+                json.dumps(
+                    canon,
+                    sort_keys=True,
+                    ensure_ascii=False,
+                    separators=(",", ":"),
+                ).encode("utf-8"),
                 ctx="tcd:policyset",
             )
-        except Exception:
+            _policy_digest_cache[key] = digest
+            return digest
+        except Exception as e:  # pragma: no cover
+            logger.exception("policy digest failed: %s", e)
             return "0" * 64
 
-    # -------- Admin endpoints --------
+    # ----------------------- Admin endpoints -----------------------
 
     @app.get("/admin/healthz", dependencies=[Depends(_require_admin)])
     def healthz():
-        s = _settings_hot.get()
+        s = _SETTINGS_HOT.get()
         return {
             "ok": True,
             "ts": time.time(),
-            "version": "0.10.2",
+            "version": _ADMIN_API_VERSION,
             "config_hash": s.config_hash(),
         }
 
     @app.get("/admin/runtime", response_model=RuntimeOut, dependencies=[Depends(_require_admin)])
     def runtime():
-        s = _settings_hot.get()
-        stats = {}
+        s = _SETTINGS_HOT.get()
+        stats: Dict[str, Any] = {}
         if ctx.runtime_stats_fn:
             try:
                 stats = dict(ctx.runtime_stats_fn() or {})
-            except Exception:
+            except Exception as e:
+                logger.warning("runtime_stats_fn failed: %s", e)
                 stats = {"error": "runtime_stats_fn failed"}
         return RuntimeOut(
-            version="0.10.2",
+            version=_ADMIN_API_VERSION,
             config_hash=s.config_hash(),
             settings=s.model_dump(),
             stats=stats,
@@ -209,15 +286,15 @@ def create_admin_app(ctx: AdminContext) -> FastAPI:
 
     @app.get("/admin/policies", response_model=PolicySet, dependencies=[Depends(_require_admin)])
     def policies_get():
-        with _admin_lock:
+        with _ADMIN_LOCK:
             return PolicySet(rules=ctx.policies.rules())
 
     @app.get("/admin/policies/ref", dependencies=[Depends(_require_admin)])
     def policies_ref():
-        with _admin_lock:
+        with _ADMIN_LOCK:
             rules = ctx.policies.rules()
             digest = _policy_digest(rules)
-            # Also expose each rule's policy_ref for traceability
+            # 也暴露每条 rule 的 policy_ref，便于追踪
             return {
                 "policyset_ref": f"set@1#{digest[:12]}",
                 "rules": [r.policy_ref() for r in rules],
@@ -225,14 +302,14 @@ def create_admin_app(ctx: AdminContext) -> FastAPI:
 
     @app.put("/admin/policies", response_model=Dict[str, Any], dependencies=[Depends(_require_admin)])
     def policies_put(ps: PolicySet):
-        with _admin_lock:
+        with _ADMIN_LOCK:
             ctx.policies.replace_rules(ps.rules or [])
             digest = _policy_digest(ctx.policies.rules())
             return {"ok": True, "policyset_ref": f"set@1#{digest[:12]}", "count": len(ctx.policies.rules())}
 
     @app.post("/admin/policies/reload", response_model=Dict[str, Any], dependencies=[Depends(_require_admin)])
     def policies_reload(req: ReloadRequest):
-        with _admin_lock:
+        with _ADMIN_LOCK:
             if req.source == "env":
                 new_store = PolicyStore.from_env()
             else:
@@ -245,15 +322,15 @@ def create_admin_app(ctx: AdminContext) -> FastAPI:
 
     @app.post("/admin/policies/bind", response_model=BoundOut, dependencies=[Depends(_require_admin)])
     def policies_bind(ctx_in: BindContext):
-        with _admin_lock:
+        with _ADMIN_LOCK:
             bound: BoundPolicy = ctx.policies.bind(ctx_in.model_dump())
         return BoundOut(
             name=bound.name,
             version=bound.version,
             policy_ref=bound.policy_ref,
             priority=bound.priority,
-            detector_cfg=bound.detector_cfg.__dict__,
-            av_cfg=bound.av_cfg.__dict__,
+            detector_cfg=_dump_cfg(bound.detector_cfg),
+            av_cfg=_dump_cfg(bound.av_cfg),
             routing={
                 "t_low": bound.t_low,
                 "t_high": bound.t_high,
@@ -276,7 +353,8 @@ def create_admin_app(ctx: AdminContext) -> FastAPI:
             return ReceiptGetOut(head_hex=head_hex, body_json=None, found=False)
         try:
             body = ctx.storage.get(head_hex)
-        except Exception:
+        except Exception as e:
+            logger.exception("storage.get failed: %s", e)
             raise HTTPException(status_code=500, detail="storage error")
         return ReceiptGetOut(head_hex=head_hex, body_json=body, found=bool(body))
 
@@ -287,7 +365,8 @@ def create_admin_app(ctx: AdminContext) -> FastAPI:
         n = max(1, min(1000, int(n)))
         try:
             items = ctx.storage.tail(n)
-        except Exception:
+        except Exception as e:
+            logger.exception("storage.tail failed: %s", e)
             raise HTTPException(status_code=500, detail="storage error")
         return ReceiptTailOut(items=items, total=len(items))
 
@@ -326,7 +405,8 @@ def create_admin_app(ctx: AdminContext) -> FastAPI:
         if ctx.alpha_probe_fn:
             try:
                 state = ctx.alpha_probe_fn(tenant, user, session)
-            except Exception:
+            except Exception as e:
+                logger.warning("alpha_probe_fn failed: %s", e)
                 state = {"error": "alpha_probe_fn failed"}
         return AlphaOut(tenant=tenant, user=user, session=session, state=state)
 
@@ -334,7 +414,7 @@ def create_admin_app(ctx: AdminContext) -> FastAPI:
 
     @app.get("/admin/config", dependencies=[Depends(_require_admin)])
     def config_get():
-        s = _settings_hot.get()
+        s = _SETTINGS_HOT.get()
         return {"config_hash": s.config_hash(), "settings": s.model_dump()}
 
     @app.post("/admin/config/reload", dependencies=[Depends(_require_admin)])
@@ -342,10 +422,11 @@ def create_admin_app(ctx: AdminContext) -> FastAPI:
         # Re-read environment-backed settings
         try:
             # Private API but acceptable inside the same package for admin-only reload
-            _settings_hot._reload()  # type: ignore[attr-defined]
-        except Exception:
+            _SETTINGS_HOT._reload()  # type: ignore[attr-defined]
+        except Exception as e:
+            logger.exception("settings reload failed: %s", e)
             raise HTTPException(status_code=500, detail="reload failed")
-        s = _settings_hot.get()
+        s = _SETTINGS_HOT.get()
         return {"ok": True, "config_hash": s.config_hash()}
 
     return app
